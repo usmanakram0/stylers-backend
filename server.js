@@ -164,9 +164,44 @@ app.get("/api/machine-data", async (req, res) => {
 /* ---------------- Dashboard APIs ---------------- */
 
 // 1️⃣ Overview
+// app.get("/api/dashboard/overview", async (req, res) => {
+//   try {
+//     const latest = await MachineData.aggregate([
+//       { $sort: { timestamp: -1 } },
+//       {
+//         $group: {
+//           _id: "$machineName",
+//           latestStatus: { $first: "$status" },
+//           lastTimestamp: { $first: "$timestamp" },
+//           shift: { $first: "$shift" },
+//         },
+//       },
+//       {
+//         $project: {
+//           machineName: "$_id",
+//           latestStatus: 1,
+//           lastTimestamp: 1,
+//           shift: 1,
+//           _id: 0,
+//         },
+//       },
+//       { $sort: { machineName: 1 } },
+//     ]);
+
+//     res.json(latest);
+//   } catch (err) {
+//     console.error("❌ /dashboard/overview error:", err);
+//     res.status(500).json({ error: "Failed to fetch overview" });
+//   }
+// });
+
+// 1️⃣ Overview (Current Shift Only)
 app.get("/api/dashboard/overview", async (req, res) => {
   try {
+    const currentShift = getCurrentShift();
+
     const latest = await MachineData.aggregate([
+      { $match: { shift: currentShift } },
       { $sort: { timestamp: -1 } },
       {
         $group: {
@@ -188,12 +223,26 @@ app.get("/api/dashboard/overview", async (req, res) => {
       { $sort: { machineName: 1 } },
     ]);
 
-    res.json(latest);
+    res.json({
+      shift: currentShift,
+      totalMachines: latest.length,
+      data: latest,
+    });
   } catch (err) {
     console.error("❌ /dashboard/overview error:", err);
     res.status(500).json({ error: "Failed to fetch overview" });
   }
 });
+
+// Shift helper function
+function getCurrentShift() {
+  const now = new Date();
+  const hours = now.getHours();
+
+  if (hours >= 6 && hours < 14) return "Morning";
+  if (hours >= 14 && hours < 22) return "Evening";
+  return "Night";
+}
 
 // 2️⃣ Stats
 app.get("/api/dashboard/stats", async (req, res) => {
