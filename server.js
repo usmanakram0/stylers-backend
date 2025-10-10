@@ -245,9 +245,41 @@ function getCurrentShift() {
 }
 
 // 2️⃣ Stats
+// app.get("/api/dashboard/stats", async (req, res) => {
+//   try {
+//     const latest = await MachineData.aggregate([
+//       { $sort: { timestamp: -1 } },
+//       {
+//         $group: {
+//           _id: "$machineName",
+//           latestStatus: { $first: "$status" },
+//         },
+//       },
+//       {
+//         $group: {
+//           _id: "$latestStatus",
+//           count: { $sum: 1 },
+//         },
+//       },
+//     ]);
+
+//     const result = {};
+//     latest.forEach((g) => (result[g._id || "UNKNOWN"] = g.count));
+
+//     res.json(result);
+//   } catch (err) {
+//     console.error("❌ /dashboard/stats error:", err);
+//     res.status(500).json({ error: "Failed to fetch stats" });
+//   }
+// });
+
+// 2️⃣ Stats (Current Shift Only)
 app.get("/api/dashboard/stats", async (req, res) => {
   try {
+    const currentShift = getCurrentShift();
+
     const latest = await MachineData.aggregate([
+      { $match: { shift: currentShift } },
       { $sort: { timestamp: -1 } },
       {
         $group: {
@@ -266,7 +298,10 @@ app.get("/api/dashboard/stats", async (req, res) => {
     const result = {};
     latest.forEach((g) => (result[g._id || "UNKNOWN"] = g.count));
 
-    res.json(result);
+    res.json({
+      shift: currentShift,
+      stats: result,
+    });
   } catch (err) {
     console.error("❌ /dashboard/stats error:", err);
     res.status(500).json({ error: "Failed to fetch stats" });
