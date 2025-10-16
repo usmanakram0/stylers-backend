@@ -13,39 +13,51 @@ const MachineData = require("./models/machineData");
 
 const app = express();
 
-const ALERT_THRESHOLD_MINUTES = 2;
+const ALERT_THRESHOLD_MINUTES = 10;
 
 async function checkDataFlowStatus() {
-  const latestDoc = await MachineData.findOne().sort({ timestamp: -1 });
+  try {
+    const latestDoc = await MachineData.findOne().sort({ timestamp: -1 });
 
-  if (!latestDoc) {
+    if (!latestDoc) {
+      return {
+        ok: false,
+        message: "⚠️ No data found in the database yet.",
+        lastUpdate: null,
+        delayMinutes: null,
+      };
+    }
+
+    const now = new Date();
+    const diffMs = now - new Date(latestDoc.timestamp);
+    const diffMinutes = diffMs / 60000;
+
+    if (diffMinutes > ALERT_THRESHOLD_MINUTES) {
+      return {
+        ok: false,
+        message: `⚠️ No new data received for ${diffMinutes.toFixed(
+          1
+        )} minute(s).`,
+        lastUpdate: latestDoc.timestamp,
+        delayMinutes: +diffMinutes.toFixed(1),
+      };
+    }
+
     return {
-      alert: true,
-      message: "No data found in database yet.",
-      lastUpdate: null,
-      minutesSinceLastUpdate: null,
-    };
-  }
-
-  const now = new Date();
-  const diffMs = now - latestDoc.timestamp;
-  const diffMinutes = diffMs / 60000;
-
-  if (diffMinutes > ALERT_THRESHOLD_MINUTES) {
-    return {
-      alert: true,
-      message: `No new data for ${diffMinutes.toFixed(1)} minute(s).`,
+      ok: true,
+      message: "✅ Dataflow is healthy and up to date.",
       lastUpdate: latestDoc.timestamp,
-      minutesSinceLastUpdate: diffMinutes.toFixed(1),
+      delayMinutes: +diffMinutes.toFixed(1),
+    };
+  } catch (err) {
+    console.error("checkDataFlowStatus error:", err);
+    return {
+      ok: false,
+      message: "❌ Failed to check dataflow status.",
+      lastUpdate: null,
+      delayMinutes: null,
     };
   }
-
-  return {
-    alert: false,
-    message: "Data flow is active.",
-    lastUpdate: latestDoc.timestamp,
-    minutesSinceLastUpdate: diffMinutes.toFixed(1),
-  };
 }
 
 // Middleware
@@ -379,7 +391,8 @@ app.get("/api/alerts/dataflow", async (req, res) => {
   }
 });
 
-// (Optional) WebSocket broadcast every 2 minutes
+// (Optional) WebSocket broadcast every 2- minutes for live alert updates
+// (Optional) WebSocket broadcast every 2- minutes for live alert updates
 setInterval(async () => {
   try {
     const status = await checkDataFlowStatus();
