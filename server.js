@@ -392,6 +392,7 @@ app.get("/api/alerts/dataflow", async (req, res) => {
 });
 
 // (Optional) WebSocket broadcast every 2- minutes for live alert updates
+// (Optional) WebSocket broadcast every 2- minutes for live alert updates
 setInterval(async () => {
   try {
     const status = await checkDataFlowStatus();
