@@ -13,6 +13,41 @@ const MachineData = require("./models/machineData");
 
 const app = express();
 
+const ALERT_THRESHOLD_MINUTES = 2;
+
+async function checkDataFlowStatus() {
+  const latestDoc = await MachineData.findOne().sort({ timestamp: -1 });
+
+  if (!latestDoc) {
+    return {
+      alert: true,
+      message: "No data found in database yet.",
+      lastUpdate: null,
+      minutesSinceLastUpdate: null,
+    };
+  }
+
+  const now = new Date();
+  const diffMs = now - latestDoc.timestamp;
+  const diffMinutes = diffMs / 60000;
+
+  if (diffMinutes > ALERT_THRESHOLD_MINUTES) {
+    return {
+      alert: true,
+      message: `No new data for ${diffMinutes.toFixed(1)} minute(s).`,
+      lastUpdate: latestDoc.timestamp,
+      minutesSinceLastUpdate: diffMinutes.toFixed(1),
+    };
+  }
+
+  return {
+    alert: false,
+    message: "Data flow is active.",
+    lastUpdate: latestDoc.timestamp,
+    minutesSinceLastUpdate: diffMinutes.toFixed(1),
+  };
+}
+
 // Middleware
 app.use(cors());
 app.use(bodyParser.json({ limit: "500mb" }));
@@ -326,6 +361,37 @@ cron.schedule("0 3 * * *", async () => {
     console.error("Retention job error:", err);
   }
 });
+
+//  -------------------------------- Data Flow Alert cron job ----------------
+
+// REST API Endpoint
+app.get("/api/alerts/dataflow", async (req, res) => {
+  try {
+    const status = await checkDataFlowStatus();
+    res.json({
+      updatedAt: new Date(),
+      thresholdMinutes: ALERT_THRESHOLD_MINUTES,
+      ...status,
+    });
+  } catch (err) {
+    console.error("❌ /api/alerts/dataflow error:", err);
+    res.status(500).json({ error: "Failed to check data flow status" });
+  }
+});
+
+// (Optional) WebSocket broadcast every 2 minutes
+setInterval(async () => {
+  try {
+    const status = await checkDataFlowStatus();
+    broadcastToDashboards({
+      type: "dataflow_alert",
+      timestamp: new Date(),
+      ...status,
+    });
+  } catch (err) {
+    console.error("Data flow alert broadcast error:", err);
+  }
+}, ALERT_THRESHOLD_MINUTES * 60 * 1000);
 
 /* ---------------- Start server ---------------- */
 const PORT = process.env.PORT || 5000;
