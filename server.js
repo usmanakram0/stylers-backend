@@ -403,6 +403,26 @@ app.get("/api/dashboard/stats", async (_, res) => {
   }
 });
 
+app.get("/api/machines/status", async (_, res) => {
+  try {
+    const rows = await MachineData.aggregate([
+      { $sort: { timestamp: -1 } },
+      { $group: { _id: "$machineName", status: { $first: "$status" } } },
+    ]);
+
+    const result = {};
+    rows.forEach((r) => {
+      result[r._id] = r.status;
+    });
+
+    console.log(`📊 Real-time status: ${Object.keys(result).length} machines`);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Machine status error:", err);
+    res.status(500).json({ error: "Failed to get machine statuses" });
+  }
+});
+
 /* =========================================================
    CSV EXPORT
    ========================================================= */
