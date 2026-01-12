@@ -18,6 +18,104 @@ const ALERT_THRESHOLD_MINUTES = 10;
    🕒 TIME HELPERS (UPDATED FOR PAKISTAN TIME)
    ========================================================= */
 
+// real time machine statuses:
+
+/* =========================================================
+   REAL-TIME STATUS POLLER (WebSocket updates)
+   ========================================================= */
+
+const activeMachines = new Map(); // machineName -> { status, lastUpdate, isActive }
+
+// Function to broadcast status to all WebSocket clients
+function broadcastStatusUpdate(machineName, status, reason = "status_change") {
+  const update = {
+    type: "machine_live_status",
+    machine: machineName,
+    status: status,
+    timestamp: new Date().toISOString(),
+    reason: reason,
+  };
+
+  broadcast(update);
+  console.log(
+    `📡 Broadcast live status: ${machineName} -> ${status} (${reason})`
+  );
+}
+
+// Periodically check machine activity
+setInterval(async () => {
+  try {
+    // Get latest statuses from database
+    const latest = await MachineData.aggregate([
+      { $sort: { timestamp: -1 } },
+      {
+        $group: {
+          _id: "$machineName",
+          status: { $first: "$status" },
+          timestamp: { $first: "$timestamp" },
+        },
+      },
+    ]);
+
+    const now = new Date();
+
+    for (const machine of latest) {
+      const machineName = machine._id;
+      const dbStatus = machine.status;
+      const lastUpdate = machine.timestamp;
+      const timeElapsed = Math.floor((now - lastUpdate) / 1000);
+
+      const previous = activeMachines.get(machineName);
+      const previousStatus = previous ? previous.status : null;
+      const previousIsActive = previous ? previous.isActive : false;
+
+      // Determine if machine is "active" (updated in last 2 minutes)
+      const isActive = timeElapsed < 120;
+
+      // Determine current status logic
+      let currentStatus = dbStatus;
+
+      // If status hasn't been updated for a while, it might have changed
+      if (!isActive) {
+        if (dbStatus === "RUNNING") {
+          // If machine was running but no updates, it's probably not running now
+          currentStatus = "UNKNOWN";
+        } else if (dbStatus === "DOWNTIME" && timeElapsed > 300) {
+          // 5 minutes
+          // Long downtime without updates might mean OFF
+          currentStatus = "OFF";
+        }
+      }
+
+      // Store in active machines map
+      activeMachines.set(machineName, {
+        status: currentStatus,
+        lastUpdate: lastUpdate,
+        isActive: isActive,
+      });
+
+      // Broadcast if status changed
+      if (previousStatus !== currentStatus) {
+        broadcastStatusUpdate(
+          machineName,
+          currentStatus,
+          previousStatus ? "status_changed" : "initial_status"
+        );
+      }
+    }
+
+    // Log active machines count
+    const activeCount = Array.from(activeMachines.values()).filter(
+      (m) => m.isActive
+    ).length;
+    console.log(
+      `🔄 Status poll: ${activeMachines.size} machines, ${activeCount} active`
+    );
+  } catch (err) {
+    console.error("❌ Status poll error:", err);
+  }
+}, 30000); // Check every 30 seconds
+
 // Parse ISO timestamp - handles naive (no timezone) as Pakistan Time (UTC+5)
 function parseToUTC(value) {
   if (!value) return null;
@@ -517,6 +615,88 @@ app.get("/health", async (_, res) => {
       error: err.message,
       timestamp: new Date().toISOString(),
     });
+  }
+});
+
+/* =========================================================
+   LIVE STATUS ENDPOINT
+   ========================================================= */
+
+app.get("/api/machines/live-status", async (req, res) => {
+  console.log("📡 Fetching live machine statuses...");
+
+  try {
+    // Get all unique machines with their latest status
+    const latestStatuses = await MachineData.aggregate([
+      {
+        $sort: { timestamp: -1 },
+      },
+      {
+        $group: {
+          _id: "$machineName",
+          status: { $first: "$status" },
+          timestamp: { $first: "$timestamp" },
+          durationSeconds: { $first: "$durationSeconds" },
+          shift: { $first: "$shift" },
+        },
+      },
+      {
+        $sort: { _id: 1 },
+      },
+    ]);
+
+    const now = new Date();
+    const results = [];
+
+    for (const machine of latestStatuses) {
+      const machineName = machine._id;
+      const lastStatus = machine.status;
+      const lastTimestamp = machine.timestamp;
+      const lastDuration = machine.durationSeconds || 0;
+
+      // Calculate time elapsed since last status change (in seconds)
+      const timeElapsed = Math.floor((now - lastTimestamp) / 1000);
+
+      // Logic to determine CURRENT status:
+      let currentStatus = lastStatus;
+
+      if (lastStatus === "DOWNTIME") {
+        // If DOWNTIME duration was short and much time has passed, it might be OFF now
+        if (timeElapsed > lastDuration * 2 && timeElapsed > 300) {
+          // 5 minutes
+          // Could be OFF now (machine was in downtime but now might be powered off)
+          // In real system, we'd need to check with PLC/actual hardware
+          // For now, we'll keep as DOWNTIME unless we have evidence it changed
+          currentStatus = "DOWNTIME";
+        }
+      } else if (lastStatus === "RUNNING") {
+        // If RUNNING was brief and much time has passed, it might be OFF/DOWNTIME
+        if (timeElapsed > lastDuration * 3 && timeElapsed > 600) {
+          // 10 minutes
+          // Running event was too brief, likely changed status
+          currentStatus = "UNKNOWN";
+        }
+      }
+
+      results.push({
+        machineName: machineName,
+        currentStatus: currentStatus,
+        lastRecordedStatus: lastStatus,
+        lastStatusChange: lastTimestamp,
+        timeSinceLastChange: timeElapsed,
+        lastDuration: lastDuration,
+        shift: machine.shift,
+        isLive: timeElapsed < 60, // Consider "live" if updated in last minute
+      });
+    }
+
+    console.log(`✅ Live status: ${results.length} machines processed`);
+    res.json(results);
+  } catch (err) {
+    console.error("❌ Error fetching live status:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch live status", details: err.message });
   }
 });
 
