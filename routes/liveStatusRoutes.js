@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const LiveStatus = require("../models/LiveStatus");
+const LiveStatus = require("../models/liveStatusSchema");
 
 /* =========================================================
    UTILITY FUNCTIONS
