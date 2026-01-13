@@ -11,12 +11,6 @@ const fs = require("fs");
 const path = require("path");
 const MachineData = require("./models/machineData");
 
-// =========================================================
-// NEW: Import LiveStatus model and routes
-// =========================================================
-const LiveStatus = require("./models/liveStatusSchema");
-const liveStatusRoutes = require("./routes/liveStatusRoutes");
-
 const app = express();
 const ALERT_THRESHOLD_MINUTES = 10;
 
@@ -24,9 +18,79 @@ const ALERT_THRESHOLD_MINUTES = 10;
    🕒 TIME HELPERS (UPDATED FOR PAKISTAN TIME)
    ========================================================= */
 
-// Remove the problematic setInterval block that uses undefined variables
-// (activeMachines and broadcastStatusUpdate are not defined)
-// We'll replace this with proper live status tracking
+// Periodically check machine activity
+setInterval(async () => {
+  try {
+    // Get latest statuses from database
+    const latest = await MachineData.aggregate([
+      { $sort: { timestamp: -1 } },
+      {
+        $group: {
+          _id: "$machineName",
+          status: { $first: "$status" },
+          timestamp: { $first: "$timestamp" },
+        },
+      },
+    ]);
+
+    const now = new Date();
+
+    for (const machine of latest) {
+      const machineName = machine._id;
+      const dbStatus = machine.status;
+      const lastUpdate = machine.timestamp;
+      const timeElapsed = Math.floor((now - lastUpdate) / 1000);
+
+      const previous = activeMachines.get(machineName);
+      const previousStatus = previous ? previous.status : null;
+      const previousIsActive = previous ? previous.isActive : false;
+
+      // Determine if machine is "active" (updated in last 2 minutes)
+      const isActive = timeElapsed < 120;
+
+      // Determine current status logic
+      let currentStatus = dbStatus;
+
+      // If status hasn't been updated for a while, it might have changed
+      if (!isActive) {
+        if (dbStatus === "RUNNING") {
+          // If machine was running but no updates, it's probably not running now
+          currentStatus = "UNKNOWN";
+        } else if (dbStatus === "DOWNTIME" && timeElapsed > 300) {
+          // 5 minutes
+          // Long downtime without updates might mean OFF
+          currentStatus = "OFF";
+        }
+      }
+
+      // Store in active machines map
+      activeMachines.set(machineName, {
+        status: currentStatus,
+        lastUpdate: lastUpdate,
+        isActive: isActive,
+      });
+
+      // Broadcast if status changed
+      if (previousStatus !== currentStatus) {
+        broadcastStatusUpdate(
+          machineName,
+          currentStatus,
+          previousStatus ? "status_changed" : "initial_status"
+        );
+      }
+    }
+
+    // Log active machines count
+    const activeCount = Array.from(activeMachines.values()).filter(
+      (m) => m.isActive
+    ).length;
+    console.log(
+      `🔄 Status poll: ${activeMachines.size} machines, ${activeCount} active`
+    );
+  } catch (err) {
+    console.error("❌ Status poll error:", err);
+  }
+}, 30000); // Check every 30 seconds
 
 // Parse ISO timestamp - handles naive (no timezone) as Pakistan Time (UTC+5)
 function parseToUTC(value) {
@@ -125,11 +189,7 @@ mongoose
           timestamp: -1,
         },
       ]);
-
-      // NEW: Also create indexes for LiveStatus
-      await LiveStatus.createIndexes();
-
-      console.log("✅ MongoDB indexes created for both collections");
+      console.log("✅ MongoDB indexes created");
     } catch (err) {
       console.log("ℹ️ Index creation note:", err.message);
     }
@@ -145,75 +205,12 @@ const wss = new WebSocketServer({ server, path: "/ws/machine-data" });
 // WebSocket connection logging
 wss.on("connection", (ws, req) => {
   console.log(`🔗 New WebSocket connection from ${req.socket.remoteAddress}`);
-
-  // NEW: Send initial live status data when client connects
-  const sendInitialLiveStatus = async () => {
-    try {
-      const liveStatuses = await LiveStatus.find({})
-        .sort({ machineName: 1 })
-        .limit(50)
-        .lean();
-
-      const initialData = {
-        type: "initial_live_status",
-        timestamp: new Date().toISOString(),
-        machines: liveStatuses.map((status) => ({
-          machine: status.machineName,
-          status: status.status,
-          machinePower: status.machinePower,
-          downtime: status.downtime,
-          lastUpdated: utcToPKT(status.lastUpdated),
-          isOnline: status.isOnline,
-          shift: status.shift,
-        })),
-      };
-
-      ws.send(JSON.stringify(initialData));
-      console.log(
-        `📡 Sent initial live status to client from ${req.socket.remoteAddress}`
-      );
-    } catch (err) {
-      console.error("❌ Error sending initial live status:", err);
-    }
-  };
-
-  // Send initial data
-  sendInitialLiveStatus();
-
   ws.on("close", () => {
     console.log(
       `🔗 WebSocket connection closed from ${req.socket.remoteAddress}`
     );
   });
-
-  ws.on("error", (err) => {
-    console.error(`❌ WebSocket error from ${req.socket.remoteAddress}:`, err);
-  });
 });
-
-// NEW: Separate broadcast function for live status updates
-function broadcastLiveStatusUpdate(
-  machineName,
-  status,
-  machinePower,
-  downtime,
-  shift,
-  lastUpdated
-) {
-  const update = {
-    type: "live_status_update",
-    machine: machineName,
-    status: status,
-    machinePower: machinePower,
-    downtime: downtime,
-    shift: shift,
-    lastUpdated: utcToPKT(lastUpdated),
-    timestamp: new Date().toISOString(),
-  };
-
-  broadcast(update);
-  console.log(`📡 Broadcasted live status: ${machineName} → ${status}`);
-}
 
 function broadcast(payload) {
   const msg = JSON.stringify(payload);
@@ -318,13 +315,10 @@ async function saveBatch(items) {
     }
   }
 
-  // NEW: Update LiveStatus collection when we save batch data
   if (saved.length > 0) {
     console.log(
       `📡 Broadcasting ${saved.length} saved items to WebSocket clients`
     );
-
-    // Broadcast machine updates (existing functionality)
     broadcast(
       saved.map((d) => ({
         type: "machine_update",
@@ -334,72 +328,6 @@ async function saveBatch(items) {
         timestamp: utcToPKT(d.timestamp), // Send PKT time to frontend
       }))
     );
-
-    // NEW: Also update LiveStatus collection
-    for (const doc of saved) {
-      try {
-        const existingLiveStatus = await LiveStatus.findOne({
-          machineName: doc.machineName,
-        });
-
-        const now = new Date();
-        const updateData = {
-          status: doc.status,
-          machinePower: doc.machinePower,
-          downtime: doc.downtime,
-          shift: doc.shift,
-          lastUpdated: now,
-          lastPolled: now,
-          isOnline: true,
-        };
-
-        if (existingLiveStatus) {
-          // Check if status changed
-          if (existingLiveStatus.status !== doc.status) {
-            updateData.lastChange = now;
-            updateData.uptimeSeconds = 0; // Reset uptime on status change
-          } else if (doc.status === "RUNNING") {
-            // Increment uptime if still running
-            const timeDiff = Math.floor(
-              (now - existingLiveStatus.lastUpdated) / 1000
-            );
-            updateData.uptimeSeconds =
-              (existingLiveStatus.uptimeSeconds || 0) + Math.max(0, timeDiff);
-          }
-
-          await LiveStatus.findOneAndUpdate(
-            { machineName: doc.machineName },
-            updateData,
-            { new: true }
-          );
-        } else {
-          // Create new live status document
-          await LiveStatus.create({
-            machineName: doc.machineName,
-            ...updateData,
-            lastChange: now,
-            uptimeSeconds: 0,
-          });
-        }
-
-        // Broadcast live status update
-        broadcastLiveStatusUpdate(
-          doc.machineName,
-          doc.status,
-          doc.machinePower,
-          doc.downtime,
-          doc.shift,
-          now
-        );
-
-        console.log(`  ✅ Updated live status for ${doc.machineName}`);
-      } catch (err) {
-        console.error(
-          `  ❌ Failed to update live status for ${doc.machineName}:`,
-          err.message
-        );
-      }
-    }
   } else {
     console.log(`📭 No items saved from this batch`);
   }
@@ -413,19 +341,13 @@ async function saveBatch(items) {
 app.get("/", (_, res) => {
   res.json({
     message: "✅ Factory Monitoring Backend Running",
-    version: "2.0",
+    version: "1.0",
     endpoints: {
       postData: "POST /api/machine-data",
       getData: "GET /api/machine-data?machine=&from=&to=&limit=",
       dashboard: "GET /api/dashboard/overview",
       stats: "GET /api/dashboard/stats",
       export: "GET /api/export?machine=&from=&to=",
-      // NEW: Live Status endpoints
-      liveStatus: "GET /api/live-status",
-      liveStatusMachine: "GET /api/live-status/:machineName",
-      liveStatusUpdate: "POST /api/live-status/update",
-      liveStatusInit: "POST /api/live-status/initialize",
-      liveStatusStats: "GET /api/live-status/stats/overview",
     },
   });
 });
@@ -637,12 +559,7 @@ app.get("/api/export", async (req, res) => {
 });
 
 /* =========================================================
-   NEW: LIVE STATUS ROUTES
-   ========================================================= */
-app.use("/api/live-status", liveStatusRoutes);
-
-/* =========================================================
-   HEALTH CHECK (UPDATED)
+   HEALTH CHECK
    ========================================================= */
 app.get("/health", async (_, res) => {
   try {
@@ -653,20 +570,11 @@ app.get("/health", async (_, res) => {
     const totalRecords = await MachineData.countDocuments({});
     const latestRecord = await MachineData.findOne({}).sort({ timestamp: -1 });
 
-    // NEW: Also get live status stats
-    const liveStatusCount = await LiveStatus.countDocuments({});
-    const onlineMachines = await LiveStatus.countDocuments({
-      isOnline: true,
-    });
-
     res.json({
       status: "healthy",
       timestamp: new Date().toISOString(),
       database: "connected",
-      collections: {
-        machineData: totalRecords,
-        liveStatus: liveStatusCount,
-      },
+      totalRecords,
       latestRecord: latestRecord
         ? {
             machine: latestRecord.machineName,
@@ -674,14 +582,6 @@ app.get("/health", async (_, res) => {
             status: latestRecord.status,
           }
         : null,
-      liveStatus: {
-        totalMachines: liveStatusCount,
-        onlineMachines: onlineMachines,
-        onlinePercentage:
-          liveStatusCount > 0
-            ? Math.round((onlineMachines / liveStatusCount) * 100)
-            : 0,
-      },
       websocketClients: wss.clients.size,
     });
   } catch (err) {
@@ -693,6 +593,10 @@ app.get("/health", async (_, res) => {
     });
   }
 });
+
+/* =========================================================
+   REAL-TIME CURRENT STATUS CALCULATION
+   ========================================================= */
 
 /* =========================================================
    RETENTION CRON
@@ -746,6 +650,4 @@ server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`📊 Dashboard: http://localhost:${PORT}/api/dashboard/overview`);
-  console.log(`📡 Live Status: http://localhost:${PORT}/api/live-status`);
-  console.log(`⚡ WebSocket: ws://localhost:${PORT}/ws/machine-data`);
 });
