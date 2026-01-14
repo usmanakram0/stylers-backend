@@ -10,12 +10,7 @@ const cron = require("node-cron");
 const fs = require("fs");
 const path = require("path");
 const MachineData = require("./models/machineData");
-
-// =========================================================
-// NEW: Import LiveStatus model and routes
-// =========================================================
-const LiveStatus = require("./models/liveStatusSchema");
-const liveStatusRoutes = require("./routes/liveStatusRoutes");
+const LiveStatus = require("./models/LiveStatus");
 
 const app = express();
 const ALERT_THRESHOLD_MINUTES = 10;
@@ -24,50 +19,24 @@ const ALERT_THRESHOLD_MINUTES = 10;
    🕒 TIME HELPERS (UPDATED FOR PAKISTAN TIME)
    ========================================================= */
 
-// Remove the problematic setInterval block that uses undefined variables
-// (activeMachines and broadcastStatusUpdate are not defined)
-// We'll replace this with proper live status tracking
-
-// Parse ISO timestamp - handles naive (no timezone) as Pakistan Time (UTC+5)
 function parseToUTC(value) {
   if (!value) return null;
 
-  // If it's already a Date object
-  if (value instanceof Date) {
-    return value;
-  }
+  if (value instanceof Date) return value;
 
-  // If it's a string
   if (typeof value === "string") {
-    // Check if it has timezone info
-    const hasTimezone =
-      value.includes("+") ||
-      value.includes("Z") ||
-      value.includes("-") ||
-      value.includes(" ");
+    const hasTimezone = /Z$|[+-]\d{2}:\d{2}$/.test(value);
 
     if (!hasTimezone) {
-      // Naive datetime (no timezone) - assume Pakistan Time (UTC+5)
-      // Example: "2024-01-09T14:30:00"
       const dt = new Date(value);
-
-      // Add 5 hours to convert PKT → UTC
-      const pktOffset = 5 * 60 * 60 * 1000; // PKT is UTC+5
-      const utcTime = new Date(dt.getTime() - pktOffset);
-
-      if (!isNaN(utcTime.getTime())) {
-        return utcTime;
-      }
-    } else {
-      // Has timezone info, let Date handle it
-      const dt = new Date(value);
-      if (!isNaN(dt.getTime())) {
-        return dt;
-      }
+      const pktOffset = 5 * 60 * 60 * 1000;
+      return new Date(dt.getTime() - pktOffset);
     }
+
+    const dt = new Date(value);
+    return isNaN(dt.getTime()) ? null : dt;
   }
 
-  // Fallback
   const d = new Date(value);
   return isNaN(d.getTime()) ? null : d;
 }
@@ -114,24 +83,23 @@ mongoose
   .then(async () => {
     console.log("✅ MongoDB Connected");
 
-    // Create indexes for better performance
+    // Existing MachineData indexes
     try {
       await MachineData.createIndexes([
-        {
-          machineName: 1,
-          timestamp: -1,
-        },
-        {
-          timestamp: -1,
-        },
+        { machineName: 1, timestamp: -1 },
+        { timestamp: -1 },
       ]);
-
-      // NEW: Also create indexes for LiveStatus
-      await LiveStatus.createIndexes();
-
-      console.log("✅ MongoDB indexes created for both collections");
+      console.log("✅ MachineData indexes created");
     } catch (err) {
-      console.log("ℹ️ Index creation note:", err.message);
+      console.log("ℹ️ MachineData index note:", err.message);
+    }
+
+    // ✅ ADD THIS BLOCK (LiveStatus index)
+    try {
+      await LiveStatus.createIndexes([{ machineName: 1 }]);
+      console.log("✅ LiveStatus index ready");
+    } catch (err) {
+      console.log("ℹ️ LiveStatus index note:", err.message);
     }
   })
   .catch((err) => console.error("❌ MongoDB Connection Error:", err));
@@ -145,75 +113,12 @@ const wss = new WebSocketServer({ server, path: "/ws/machine-data" });
 // WebSocket connection logging
 wss.on("connection", (ws, req) => {
   console.log(`🔗 New WebSocket connection from ${req.socket.remoteAddress}`);
-
-  // NEW: Send initial live status data when client connects
-  const sendInitialLiveStatus = async () => {
-    try {
-      const liveStatuses = await LiveStatus.find({})
-        .sort({ machineName: 1 })
-        .limit(50)
-        .lean();
-
-      const initialData = {
-        type: "initial_live_status",
-        timestamp: new Date().toISOString(),
-        machines: liveStatuses.map((status) => ({
-          machine: status.machineName,
-          status: status.status,
-          machinePower: status.machinePower,
-          downtime: status.downtime,
-          lastUpdated: utcToPKT(status.lastUpdated),
-          isOnline: status.isOnline,
-          shift: status.shift,
-        })),
-      };
-
-      ws.send(JSON.stringify(initialData));
-      console.log(
-        `📡 Sent initial live status to client from ${req.socket.remoteAddress}`
-      );
-    } catch (err) {
-      console.error("❌ Error sending initial live status:", err);
-    }
-  };
-
-  // Send initial data
-  sendInitialLiveStatus();
-
   ws.on("close", () => {
     console.log(
       `🔗 WebSocket connection closed from ${req.socket.remoteAddress}`
     );
   });
-
-  ws.on("error", (err) => {
-    console.error(`❌ WebSocket error from ${req.socket.remoteAddress}:`, err);
-  });
 });
-
-// NEW: Separate broadcast function for live status updates
-function broadcastLiveStatusUpdate(
-  machineName,
-  status,
-  machinePower,
-  downtime,
-  shift,
-  lastUpdated
-) {
-  const update = {
-    type: "live_status_update",
-    machine: machineName,
-    status: status,
-    machinePower: machinePower,
-    downtime: downtime,
-    shift: shift,
-    lastUpdated: utcToPKT(lastUpdated),
-    timestamp: new Date().toISOString(),
-  };
-
-  broadcast(update);
-  console.log(`📡 Broadcasted live status: ${machineName} → ${status}`);
-}
 
 function broadcast(payload) {
   const msg = JSON.stringify(payload);
@@ -318,13 +223,10 @@ async function saveBatch(items) {
     }
   }
 
-  // NEW: Update LiveStatus collection when we save batch data
   if (saved.length > 0) {
     console.log(
       `📡 Broadcasting ${saved.length} saved items to WebSocket clients`
     );
-
-    // Broadcast machine updates (existing functionality)
     broadcast(
       saved.map((d) => ({
         type: "machine_update",
@@ -334,72 +236,6 @@ async function saveBatch(items) {
         timestamp: utcToPKT(d.timestamp), // Send PKT time to frontend
       }))
     );
-
-    // NEW: Also update LiveStatus collection
-    for (const doc of saved) {
-      try {
-        const existingLiveStatus = await LiveStatus.findOne({
-          machineName: doc.machineName,
-        });
-
-        const now = new Date();
-        const updateData = {
-          status: doc.status,
-          machinePower: doc.machinePower,
-          downtime: doc.downtime,
-          shift: doc.shift,
-          lastUpdated: now,
-          lastPolled: now,
-          isOnline: true,
-        };
-
-        if (existingLiveStatus) {
-          // Check if status changed
-          if (existingLiveStatus.status !== doc.status) {
-            updateData.lastChange = now;
-            updateData.uptimeSeconds = 0; // Reset uptime on status change
-          } else if (doc.status === "RUNNING") {
-            // Increment uptime if still running
-            const timeDiff = Math.floor(
-              (now - existingLiveStatus.lastUpdated) / 1000
-            );
-            updateData.uptimeSeconds =
-              (existingLiveStatus.uptimeSeconds || 0) + Math.max(0, timeDiff);
-          }
-
-          await LiveStatus.findOneAndUpdate(
-            { machineName: doc.machineName },
-            updateData,
-            { new: true }
-          );
-        } else {
-          // Create new live status document
-          await LiveStatus.create({
-            machineName: doc.machineName,
-            ...updateData,
-            lastChange: now,
-            uptimeSeconds: 0,
-          });
-        }
-
-        // Broadcast live status update
-        broadcastLiveStatusUpdate(
-          doc.machineName,
-          doc.status,
-          doc.machinePower,
-          doc.downtime,
-          doc.shift,
-          now
-        );
-
-        console.log(`  ✅ Updated live status for ${doc.machineName}`);
-      } catch (err) {
-        console.error(
-          `  ❌ Failed to update live status for ${doc.machineName}:`,
-          err.message
-        );
-      }
-    }
   } else {
     console.log(`📭 No items saved from this batch`);
   }
@@ -413,19 +249,13 @@ async function saveBatch(items) {
 app.get("/", (_, res) => {
   res.json({
     message: "✅ Factory Monitoring Backend Running",
-    version: "2.0",
+    version: "1.0",
     endpoints: {
       postData: "POST /api/machine-data",
       getData: "GET /api/machine-data?machine=&from=&to=&limit=",
       dashboard: "GET /api/dashboard/overview",
       stats: "GET /api/dashboard/stats",
       export: "GET /api/export?machine=&from=&to=",
-      // NEW: Live Status endpoints
-      liveStatus: "GET /api/live-status",
-      liveStatusMachine: "GET /api/live-status/:machineName",
-      liveStatusUpdate: "POST /api/live-status/update",
-      liveStatusInit: "POST /api/live-status/initialize",
-      liveStatusStats: "GET /api/live-status/stats/overview",
     },
   });
 });
@@ -451,46 +281,6 @@ app.post("/api/machine-data", async (req, res) => {
     received: items.length,
     timestamp: new Date().toISOString(),
   });
-});
-
-/* ---------- GET DATA (returns PKT time) ---------- */
-app.get("/api/machine-data", async (req, res) => {
-  const { machine, from, to, limit = 1000 } = req.query;
-  console.log(
-    `📤 GET request: machine=${machine}, from=${from}, to=${to}, limit=${limit}`
-  );
-
-  const q = {};
-
-  if (machine) q.machineName = machine;
-
-  q.timestamp = {
-    $gte: from ? parseToUTC(from) : new Date(Date.now() - 86400000), // Last 24 hours
-    $lte: to ? parseToUTC(to) : new Date(),
-  };
-
-  try {
-    const docs = await MachineData.find(q)
-      .sort({ timestamp: -1 })
-      .limit(Math.min(parseInt(limit), 5000)) // Cap at 5000 for safety
-      .lean();
-
-    console.log(`📊 Found ${docs.length} documents`);
-
-    // Convert UTC timestamps to PKT for frontend
-    const results = docs.map((d) => ({
-      ...d,
-      timestamp: utcToPKT(d.timestamp), // Convert to PKT
-      _id: d._id.toString(),
-    }));
-
-    res.json(results);
-  } catch (err) {
-    console.error("❌ Error fetching data:", err);
-    res
-      .status(500)
-      .json({ error: "Failed to fetch data", details: err.message });
-  }
 });
 
 /* =========================================================
@@ -637,12 +427,7 @@ app.get("/api/export", async (req, res) => {
 });
 
 /* =========================================================
-   NEW: LIVE STATUS ROUTES
-   ========================================================= */
-app.use("/api/live-status", liveStatusRoutes);
-
-/* =========================================================
-   HEALTH CHECK (UPDATED)
+   HEALTH CHECK
    ========================================================= */
 app.get("/health", async (_, res) => {
   try {
@@ -653,20 +438,11 @@ app.get("/health", async (_, res) => {
     const totalRecords = await MachineData.countDocuments({});
     const latestRecord = await MachineData.findOne({}).sort({ timestamp: -1 });
 
-    // NEW: Also get live status stats
-    const liveStatusCount = await LiveStatus.countDocuments({});
-    const onlineMachines = await LiveStatus.countDocuments({
-      isOnline: true,
-    });
-
     res.json({
       status: "healthy",
       timestamp: new Date().toISOString(),
       database: "connected",
-      collections: {
-        machineData: totalRecords,
-        liveStatus: liveStatusCount,
-      },
+      totalRecords,
       latestRecord: latestRecord
         ? {
             machine: latestRecord.machineName,
@@ -674,14 +450,6 @@ app.get("/health", async (_, res) => {
             status: latestRecord.status,
           }
         : null,
-      liveStatus: {
-        totalMachines: liveStatusCount,
-        onlineMachines: onlineMachines,
-        onlinePercentage:
-          liveStatusCount > 0
-            ? Math.round((onlineMachines / liveStatusCount) * 100)
-            : 0,
-      },
       websocketClients: wss.clients.size,
     });
   } catch (err) {
@@ -726,6 +494,68 @@ cron.schedule("0 3 * * *", async () => {
   }
 });
 
+async function saveLiveStatuses(items) {
+  const ops = [];
+
+  for (const item of items) {
+    if (!item.machine || !item.status) continue;
+
+    ops.push(
+      LiveStatus.updateOne(
+        { machineName: item.machine },
+        {
+          $set: {
+            status: item.status,
+            updatedAt: parseToUTC(item.timestamp || new Date()),
+          },
+        },
+        { upsert: true }
+      )
+    );
+  }
+
+  if (ops.length) {
+    await Promise.all(ops);
+
+    broadcast({
+      type: "live_status_update",
+      data: items.map((i) => ({
+        machine: i.machine,
+        status: i.status,
+        timestamp: utcToPKT(i.timestamp || new Date()),
+      })),
+    });
+  }
+}
+
+/* =========================================================
+   ✅ NEW LIVE STATUS APIs (ADDITION ONLY)
+   ========================================================= */
+
+app.put("/api/live-status", async (req, res) => {
+  const items = Array.isArray(req.body) ? req.body : [req.body];
+  await saveLiveStatuses(items);
+  res.json({ ok: true, updated: items.length });
+});
+
+app.get("/api/live-status", async (_, res) => {
+  const rows = await LiveStatus.find({}).lean();
+  res.json(
+    rows.map((r) => ({
+      machine: r.machineName,
+      status: r.status,
+      updatedAt: utcToPKT(r.updatedAt),
+    }))
+  );
+});
+
+app.get("/api/live-status/map", async (_, res) => {
+  const rows = await LiveStatus.find({}).lean();
+  const map = {};
+  rows.forEach((r) => (map[r.machineName] = r.status));
+  res.json(map);
+});
+
 /* =========================================================
    ERROR HANDLING MIDDLEWARE
    ========================================================= */
@@ -746,6 +576,4 @@ server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`📊 Dashboard: http://localhost:${PORT}/api/dashboard/overview`);
-  console.log(`📡 Live Status: http://localhost:${PORT}/api/live-status`);
-  console.log(`⚡ WebSocket: ws://localhost:${PORT}/ws/machine-data`);
 });
