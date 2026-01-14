@@ -365,9 +365,49 @@ app.get("/api/machines/status", async (_, res) => {
   }
 });
 
+app.get("/api/machine-data", async (req, res) => {
+  const { machine, from, to, limit = 1000 } = req.query;
+  console.log(
+    `📤 GET request: machine=${machine}, from=${from}, to=${to}, limit=${limit}`
+  );
+
+  const q = {};
+
+  if (machine) q.machineName = machine;
+
+  q.timestamp = {
+    $gte: from ? parseToUTC(from) : new Date(Date.now() - 86400000), // Last 24 hours
+    $lte: to ? parseToUTC(to) : new Date(),
+  };
+
+  try {
+    const docs = await MachineData.find(q)
+      .sort({ timestamp: -1 })
+      .limit(Math.min(parseInt(limit), 5000)) // Cap at 5000 for safety
+      .lean();
+
+    console.log(`📊 Found ${docs.length} documents`);
+
+    // Convert UTC timestamps to PKT for frontend
+    const results = docs.map((d) => ({
+      ...d,
+      timestamp: utcToPKT(d.timestamp), // Convert to PKT
+      _id: d._id.toString(),
+    }));
+
+    res.json(results);
+  } catch (err) {
+    console.error("❌ Error fetching data:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch data", details: err.message });
+  }
+});
+
 /* =========================================================
    CSV EXPORT
    ========================================================= */
+
 app.get("/api/export", async (req, res) => {
   const { from, to, machine } = req.query;
   console.log(`📥 Export request: machine=${machine}, from=${from}, to=${to}`);
