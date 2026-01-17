@@ -169,18 +169,36 @@ async function filterDuplicates(items) {
    🧠 SAVE LOGIC (UPDATED WITH DUPLICATE PREVENTION)
    ========================================================= */
 async function saveBatch(items) {
+  // Step 1: Filter duplicates in memory
   const uniqueItems = await filterDuplicates(items);
-  const saved = [];
 
   if (uniqueItems.length === 0) {
-    return saved;
+    console.log(
+      `📭 All ${items.length} items were duplicates, nothing to save`,
+    );
+    return [];
   }
 
+  console.log(
+    `💾 Processing ${uniqueItems.length} unique items (filtered from ${items.length} total)...`,
+  );
+  const saved = [];
   const CHUNK_SIZE = 50;
 
-  for (let startIdx = 0; startIdx < items.length; startIdx += CHUNK_SIZE) {
-    const chunk = items.slice(startIdx, startIdx + CHUNK_SIZE);
+  // ✅ FIXED: Process uniqueItems, not items
+  for (
+    let startIdx = 0;
+    startIdx < uniqueItems.length;
+    startIdx += CHUNK_SIZE
+  ) {
+    const chunk = uniqueItems.slice(startIdx, startIdx + CHUNK_SIZE);
     const chunkNumber = Math.floor(startIdx / CHUNK_SIZE) + 1;
+    const totalChunks = Math.ceil(uniqueItems.length / CHUNK_SIZE);
+
+    console.log(
+      `📦 Processing chunk ${chunkNumber}/${totalChunks} (items ${startIdx + 1}-${Math.min(startIdx + CHUNK_SIZE, uniqueItems.length)})`,
+    );
+
     // Process this chunk
     for (let i = 0; i < chunk.length; i++) {
       const item = chunk[i];
@@ -194,13 +212,12 @@ async function saveBatch(items) {
 
       const tsUTC = parseToUTC(timestamp);
       if (!tsUTC || !machine) {
-        console.log(`  ⚠️ Skipping: Invalid data for item ${startIdx + i + 1}`);
+        console.log(`  ⚠️ Skipping: Invalid data`);
         continue;
       }
 
-      // 🔥 ADD THIS: Check for existing record before saving
       try {
-        // Check if we already have this exact record
+        // Check for existing record before saving
         const existing = await MachineData.findOne({
           machineName: machine,
           timestamp: tsUTC,
@@ -211,10 +228,10 @@ async function saveBatch(items) {
           console.log(
             `  ⏭️ Skipping duplicate: ${machine} at ${tsUTC.toISOString()} - ${status}`,
           );
-          continue; // Skip this item
+          continue;
         }
 
-        // Also check for very recent records (within 1 second) to avoid near-duplicates
+        // Check for near-duplicates
         const oneSecondAgo = new Date(tsUTC.getTime() - 1000);
         const oneSecondLater = new Date(tsUTC.getTime() + 1000);
 
@@ -261,11 +278,11 @@ async function saveBatch(items) {
       }
     }
 
-    // 🔥 Memory cleanup after each chunk
+    // Memory cleanup
     chunk.length = 0;
-    await new Promise((resolve) => setImmediate(resolve)); // Allow garbage collection
+    await new Promise((resolve) => setImmediate(resolve));
 
-    // Log memory usage every 5 chunks
+    // Log memory usage
     if (chunkNumber % 5 === 0) {
       const used = process.memoryUsage();
       console.log(
@@ -286,7 +303,7 @@ async function saveBatch(items) {
       })),
     );
   } else {
-    console.log(`📭 No items saved from this batch`);
+    console.log(`📭 No new items saved from this batch`);
   }
 
   return saved;
