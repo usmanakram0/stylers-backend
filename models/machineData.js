@@ -47,7 +47,7 @@ const MachineDataSchema = new mongoose.Schema(
   {
     timestamps: true, // createdAt / updatedAt
     versionKey: false,
-  }
+  },
 );
 
 /* =========================================================
