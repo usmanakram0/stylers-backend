@@ -66,7 +66,7 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   if (req.method === "POST" && req.body) {
     console.log(
-      `📥 Request body length: ${Array.isArray(req.body) ? req.body.length : 1}`
+      `📥 Request body length: ${Array.isArray(req.body) ? req.body.length : 1}`,
     );
   }
   next();
@@ -115,7 +115,7 @@ wss.on("connection", (ws, req) => {
   console.log(`🔗 New WebSocket connection from ${req.socket.remoteAddress}`);
   ws.on("close", () => {
     console.log(
-      `🔗 WebSocket connection closed from ${req.socket.remoteAddress}`
+      `🔗 WebSocket connection closed from ${req.socket.remoteAddress}`,
     );
   });
 });
@@ -135,114 +135,86 @@ function broadcast(payload) {
 }
 
 /* =========================================================
-   🧠 SAVE LOGIC (UPDATED FOR NAIVE TIMESTAMPS)
+   🧠 SAVE LOGIC (UPDATED WITH SIMPLE CHUNKING)
    ========================================================= */
 async function saveBatch(items) {
   console.log(`💾 Processing batch of ${items.length} items...`);
   const saved = [];
 
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const {
-      timestamp,
-      machine,
-      status,
-      durationSeconds = 0,
-      shift = null,
-    } = item;
+  // 🔥 ADD THIS SIMPLE CHUNKING
+  const CHUNK_SIZE = 50; // Process 50 items at a time
+
+  for (let startIdx = 0; startIdx < items.length; startIdx += CHUNK_SIZE) {
+    const chunk = items.slice(startIdx, startIdx + CHUNK_SIZE);
+    const chunkNumber = Math.floor(startIdx / CHUNK_SIZE) + 1;
 
     console.log(
-      `  Processing item ${i + 1}/${
-        items.length
-      }: ${machine} - ${status} - ${timestamp}`
+      `📦 Processing chunk ${chunkNumber} (items ${startIdx + 1}-${Math.min(startIdx + CHUNK_SIZE, items.length)})`,
     );
 
-    const tsUTC = parseToUTC(timestamp);
-    if (!tsUTC) {
-      console.log(
-        `  ⚠️ Skipping: Invalid timestamp "${timestamp}" for machine ${machine}`
-      );
-      continue;
-    }
+    // Process this chunk
+    for (let i = 0; i < chunk.length; i++) {
+      const item = chunk[i];
+      const {
+        timestamp,
+        machine,
+        status,
+        durationSeconds = 0,
+        shift = null,
+      } = item;
 
-    if (!machine) {
-      console.log(`  ⚠️ Skipping: No machine name`);
-      continue;
-    }
+      const tsUTC = parseToUTC(timestamp);
+      if (!tsUTC || !machine) continue;
 
-    // TEMPORARILY DISABLED: Check for stale/duplicate packets
-    // This might be blocking valid data due to timezone confusion
-    /*
-    try {
-      const latest = await MachineData.findOne({
-        machineName: machine,
-      }).sort({ timestamp: -1 });
+      try {
+        const doc = await MachineData.create({
+          timestamp: tsUTC,
+          machineName: machine,
+          status: status || "UNKNOWN",
+          machinePower: status === "RUNNING" || status === "DOWNTIME",
+          downtime: status === "DOWNTIME",
+          shift:
+            shift ||
+            (() => {
+              const hour = tsUTC.getUTCHours() + 5;
+              if (hour >= 7 && hour < 15) return "Morning";
+              if (hour >= 15 && hour < 23) return "Evening";
+              return "Night";
+            })(),
+          durationSeconds,
+        });
 
-      if (latest && tsUTC <= latest.timestamp) {
-        console.log(`  ⏭️ Skipping duplicate/older data for ${machine}:`);
-        console.log(`     New: ${tsUTC.toISOString()}, Latest in DB: ${latest.timestamp.toISOString()}`);
-        continue;
-      }
-    } catch (err) {
-      console.log(`  ℹ️ Could not check latest record for ${machine}:`, err.message);
-    }
-    */
-
-    try {
-      const doc = await MachineData.create({
-        timestamp: tsUTC,
-        machineName: machine,
-        status: status || "UNKNOWN",
-        machinePower: status === "RUNNING" || status === "DOWNTIME",
-        downtime: status === "DOWNTIME",
-        shift:
-          shift ||
-          (() => {
-            // Calculate shift if not provided
-            const hour = tsUTC.getUTCHours() + 5; // Convert UTC to PKT
-            if (hour >= 7 && hour < 15) return "Morning";
-            if (hour >= 15 && hour < 23) return "Evening";
-            return "Night";
-          })(),
-        durationSeconds,
-      });
-
-      saved.push(doc);
-      console.log(
-        `  ✅ Saved: ${machine} at ${tsUTC.toISOString()} (UTC) - ${status}`
-      );
-    } catch (err) {
-      // Duplicate safety (DB-level unique constraint)
-      if (err.code === 11000) {
+        saved.push(doc);
         console.log(
-          `  ⏭️ MongoDB duplicate key prevented for ${machine} at ${tsUTC.toISOString()}`
+          `  ✅ Saved: ${machine} at ${tsUTC.toISOString()} - ${status}`,
         );
-      } else {
-        console.error(`  ❌ Save error for ${machine}:`, err.message);
+      } catch (err) {
+        if (err.code !== 11000) {
+          console.error(`  ❌ Save error for ${machine}:`, err.message);
+        }
       }
     }
+
+    // 🔥 Memory cleanup after each chunk
+    chunk.length = 0;
+    await new Promise((resolve) => setImmediate(resolve)); // Allow garbage collection
   }
 
   if (saved.length > 0) {
-    console.log(
-      `📡 Broadcasting ${saved.length} saved items to WebSocket clients`
-    );
+    console.log(`📡 Broadcasting ${saved.length} saved items`);
     broadcast(
       saved.map((d) => ({
         type: "machine_update",
         machine: d.machineName,
         status: d.status,
         shift: d.shift,
-        timestamp: utcToPKT(d.timestamp), // Send PKT time to frontend
-      }))
+        timestamp: utcToPKT(d.timestamp),
+      })),
     );
-  } else {
-    console.log(`📭 No items saved from this batch`);
   }
 
   return saved;
 }
-
 /* =========================================================
    REST APIs
    ========================================================= */
@@ -368,7 +340,7 @@ app.get("/api/machines/status", async (_, res) => {
 app.get("/api/machine-data", async (req, res) => {
   const { machine, from, to, limit = 1000 } = req.query;
   console.log(
-    `📤 GET request: machine=${machine}, from=${from}, to=${to}, limit=${limit}`
+    `📤 GET request: machine=${machine}, from=${from}, to=${to}, limit=${limit}`,
   );
 
   const q = {};
@@ -549,8 +521,8 @@ async function saveLiveStatuses(items) {
             updatedAt: parseToUTC(item.timestamp || new Date()),
           },
         },
-        { upsert: true }
-      )
+        { upsert: true },
+      ),
     );
   }
 
@@ -585,7 +557,7 @@ app.get("/api/live-status", async (_, res) => {
       machine: r.machineName,
       status: r.status,
       updatedAt: utcToPKT(r.updatedAt),
-    }))
+    })),
   );
 });
 
