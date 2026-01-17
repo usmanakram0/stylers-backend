@@ -134,24 +134,53 @@ function broadcast(payload) {
   }
 }
 
+async function filterDuplicates(items) {
+  if (items.length === 0) return items;
+
+  console.log(`🔍 Checking ${items.length} items for duplicates...`);
+  const uniqueItems = [];
+  const seen = new Map(); // Track machine + timestamp combinations
+
+  for (const item of items) {
+    const tsUTC = parseToUTC(item.timestamp);
+    if (!tsUTC || !item.machine) continue;
+
+    // Create a unique key: machine + rounded timestamp (to the second)
+    const timeKey = Math.floor(tsUTC.getTime() / 1000);
+    const uniqueKey = `${item.machine}_${timeKey}_${item.status || "UNKNOWN"}`;
+
+    if (!seen.has(uniqueKey)) {
+      seen.set(uniqueKey, true);
+      uniqueItems.push(item);
+    } else {
+      console.log(
+        `  🔍 Skipping in-memory duplicate: ${item.machine} at ${tsUTC.toISOString()}`,
+      );
+    }
+  }
+
+  console.log(
+    `🔍 Filtered ${items.length - uniqueItems.length} duplicates, ${uniqueItems.length} unique items remain`,
+  );
+  return uniqueItems;
+}
+
 /* =========================================================
-   🧠 SAVE LOGIC (UPDATED WITH SIMPLE CHUNKING)
+   🧠 SAVE LOGIC (UPDATED WITH DUPLICATE PREVENTION)
    ========================================================= */
 async function saveBatch(items) {
-  console.log(`💾 Processing batch of ${items.length} items...`);
+  const uniqueItems = await filterDuplicates(items);
   const saved = [];
 
-  // 🔥 ADD THIS SIMPLE CHUNKING
-  const CHUNK_SIZE = 50; // Process 50 items at a time
+  if (uniqueItems.length === 0) {
+    return saved;
+  }
+
+  const CHUNK_SIZE = 50;
 
   for (let startIdx = 0; startIdx < items.length; startIdx += CHUNK_SIZE) {
     const chunk = items.slice(startIdx, startIdx + CHUNK_SIZE);
     const chunkNumber = Math.floor(startIdx / CHUNK_SIZE) + 1;
-
-    console.log(
-      `📦 Processing chunk ${chunkNumber} (items ${startIdx + 1}-${Math.min(startIdx + CHUNK_SIZE, items.length)})`,
-    );
-
     // Process this chunk
     for (let i = 0; i < chunk.length; i++) {
       const item = chunk[i];
@@ -164,9 +193,44 @@ async function saveBatch(items) {
       } = item;
 
       const tsUTC = parseToUTC(timestamp);
-      if (!tsUTC || !machine) continue;
+      if (!tsUTC || !machine) {
+        console.log(`  ⚠️ Skipping: Invalid data for item ${startIdx + i + 1}`);
+        continue;
+      }
 
+      // 🔥 ADD THIS: Check for existing record before saving
       try {
+        // Check if we already have this exact record
+        const existing = await MachineData.findOne({
+          machineName: machine,
+          timestamp: tsUTC,
+          status: status || "UNKNOWN",
+        });
+
+        if (existing) {
+          console.log(
+            `  ⏭️ Skipping duplicate: ${machine} at ${tsUTC.toISOString()} - ${status}`,
+          );
+          continue; // Skip this item
+        }
+
+        // Also check for very recent records (within 1 second) to avoid near-duplicates
+        const oneSecondAgo = new Date(tsUTC.getTime() - 1000);
+        const oneSecondLater = new Date(tsUTC.getTime() + 1000);
+
+        const recentDuplicate = await MachineData.findOne({
+          machineName: machine,
+          timestamp: { $gte: oneSecondAgo, $lte: oneSecondLater },
+          status: status || "UNKNOWN",
+        });
+
+        if (recentDuplicate) {
+          console.log(
+            `  ⏭️ Skipping near-duplicate (within 1s): ${machine} around ${tsUTC.toISOString()}`,
+          );
+          continue;
+        }
+
         const doc = await MachineData.create({
           timestamp: tsUTC,
           machineName: machine,
@@ -189,7 +253,9 @@ async function saveBatch(items) {
           `  ✅ Saved: ${machine} at ${tsUTC.toISOString()} - ${status}`,
         );
       } catch (err) {
-        if (err.code !== 11000) {
+        if (err.code === 11000) {
+          console.log(`  ⏭️ MongoDB prevented duplicate for ${machine}`);
+        } else {
           console.error(`  ❌ Save error for ${machine}:`, err.message);
         }
       }
@@ -198,6 +264,14 @@ async function saveBatch(items) {
     // 🔥 Memory cleanup after each chunk
     chunk.length = 0;
     await new Promise((resolve) => setImmediate(resolve)); // Allow garbage collection
+
+    // Log memory usage every 5 chunks
+    if (chunkNumber % 5 === 0) {
+      const used = process.memoryUsage();
+      console.log(
+        `📊 Memory after chunk ${chunkNumber}: ${Math.round(used.heapUsed / 1024 / 1024)}MB`,
+      );
+    }
   }
 
   if (saved.length > 0) {
@@ -211,6 +285,8 @@ async function saveBatch(items) {
         timestamp: utcToPKT(d.timestamp),
       })),
     );
+  } else {
+    console.log(`📭 No items saved from this batch`);
   }
 
   return saved;
