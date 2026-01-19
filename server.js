@@ -217,58 +217,68 @@ async function saveBatch(items) {
       }
 
       try {
-        // Check for existing record before saving
-        const existing = await MachineData.findOne({
-          machineName: machine,
-          timestamp: tsUTC,
-          status: status || "UNKNOWN",
-        });
+        // =========================================================
+        // ✅ PERMANENT DUPLICATE PREVENTION - NEW CODE
+        // =========================================================
 
-        if (existing) {
-          console.log(
-            `  ⏭️ Skipping duplicate: ${machine} at ${tsUTC.toISOString()} - ${status}`,
-          );
-          continue;
-        }
-
-        // Check for near-duplicates
-        const oneSecondAgo = new Date(tsUTC.getTime() - 1000);
-        const oneSecondLater = new Date(tsUTC.getTime() + 1000);
-
-        const recentDuplicate = await MachineData.findOne({
-          machineName: machine,
-          timestamp: { $gte: oneSecondAgo, $lte: oneSecondLater },
-          status: status || "UNKNOWN",
-        });
-
-        if (recentDuplicate) {
-          console.log(
-            `  ⏭️ Skipping near-duplicate (within 1s): ${machine} around ${tsUTC.toISOString()}`,
-          );
-          continue;
-        }
-
-        const doc = await MachineData.create({
-          timestamp: tsUTC,
-          machineName: machine,
-          status: status || "UNKNOWN",
-          machinePower: status === "RUNNING" || status === "DOWNTIME",
-          downtime: status === "DOWNTIME",
-          shift:
-            shift ||
-            (() => {
-              const hour = tsUTC.getUTCHours() + 5;
-              if (hour >= 7 && hour < 15) return "Morning";
-              if (hour >= 15 && hour < 23) return "Evening";
-              return "Night";
-            })(),
-          durationSeconds,
-        });
-
-        saved.push(doc);
-        console.log(
-          `  ✅ Saved: ${machine} at ${tsUTC.toISOString()} - ${status}`,
+        // 1. Round the timestamp to nearest second (removes millisecond differences)
+        const roundedTimestamp = new Date(
+          Math.floor(tsUTC.getTime() / 1000) * 1000,
         );
+
+        // 2. Use upsert with rounded timestamp
+        const result = await MachineData.findOneAndUpdate(
+          {
+            machineName: machine,
+            timestamp: {
+              $gte: new Date(roundedTimestamp.getTime() - 1000), // 1 second before
+              $lte: new Date(roundedTimestamp.getTime() + 1000), // 1 second after
+            },
+            status: status || "UNKNOWN",
+          },
+          {
+            $setOnInsert: {
+              timestamp: roundedTimestamp, // Use rounded timestamp
+              machineName: machine,
+              status: status || "UNKNOWN",
+              machinePower: status === "RUNNING" || status === "DOWNTIME",
+              downtime: status === "DOWNTIME",
+              shift:
+                shift ||
+                (() => {
+                  const hour = tsUTC.getUTCHours() + 5;
+                  if (hour >= 7 && hour < 15) return "Morning";
+                  if (hour >= 15 && hour < 23) return "Evening";
+                  return "Night";
+                })(),
+              durationSeconds: durationSeconds,
+            },
+            $set: {
+              // Update these fields if document already exists
+              updatedAt: new Date(),
+            },
+          },
+          {
+            upsert: true, // Insert if doesn't exist
+            new: true, // Return the new/updated document
+            runValidators: true,
+            setDefaultsOnInsert: true,
+          },
+        );
+
+        if (result.$isNew || !result._id) {
+          console.log(
+            `  ✅ Inserted new: ${machine} at ${roundedTimestamp.toISOString()} - ${status}`,
+          );
+          saved.push(result);
+        } else {
+          console.log(
+            `  🔄 Updated existing: ${machine} at ${roundedTimestamp.toISOString()}`,
+          );
+        }
+        // =========================================================
+        // END OF NEW CODE
+        // =========================================================
       } catch (err) {
         if (err.code === 11000) {
           console.log(`  ⏭️ MongoDB prevented duplicate for ${machine}`);

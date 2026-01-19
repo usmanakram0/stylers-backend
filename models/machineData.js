@@ -54,6 +54,34 @@ const MachineDataSchema = new mongoose.Schema(
    🔐 CRITICAL INDEXES
    ========================================================= */
 
+// Add this method to your schema (inside the schema definition):
+MachineDataSchema.methods.getUniqueKey = function () {
+  // Round timestamp to nearest second (removes milliseconds)
+  const roundedTimestamp = new Date(
+    Math.floor(this.timestamp.getTime() / 1000) * 1000,
+  );
+  return `${this.machineName}_${roundedTimestamp.toISOString()}`;
+};
+
+// Create a static method to check for duplicates
+MachineDataSchema.statics.findDuplicate = async function (
+  machineName,
+  timestamp,
+) {
+  // Round timestamp to nearest second for comparison
+  const roundedTimestamp = new Date(
+    Math.floor(timestamp.getTime() / 1000) * 1000,
+  );
+
+  return await this.findOne({
+    machineName: machineName,
+    timestamp: {
+      $gte: new Date(roundedTimestamp.getTime() - 1000), // 1 second before
+      $lte: new Date(roundedTimestamp.getTime() + 1000), // 1 second after
+    },
+  });
+};
+
 // ✅ Prevent duplicates forever
 MachineDataSchema.index({ machineName: 1, timestamp: 1 }, { unique: true });
 
