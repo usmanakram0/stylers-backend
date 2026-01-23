@@ -15,46 +15,6 @@ const LiveStatus = require("./models/LiveStatus");
 const app = express();
 const ALERT_THRESHOLD_MINUTES = 10;
 
-// Memory monitoring
-let peakMemory = 0;
-function logMemory(label = "") {
-  const used = process.memoryUsage();
-  const heapMB = Math.round(used.heapUsed / 1024 / 1024);
-  if (heapMB > peakMemory) peakMemory = heapMB;
-
-  if (heapMB > 100) {
-    // Warn if over 100MB
-    console.warn(
-      `🚨 ${label} High memory: ${heapMB}MB (Peak: ${peakMemory}MB)`,
-    );
-  }
-  return heapMB;
-}
-
-// Auto-restart if memory gets too high
-const MAX_MEMORY_MB = 450; // Restart before Railway kills us (at 512MB)
-
-setInterval(() => {
-  const mem = process.memoryUsage();
-  const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
-
-  if (heapMB > MAX_MEMORY_MB) {
-    console.error(`🚨 CRITICAL: Memory at ${heapMB}MB, restarting...`);
-
-    // Graceful shutdown
-    server.close(() => {
-      console.log("✅ Server closed gracefully");
-      process.exit(0);
-    });
-
-    // Force exit after 5 seconds
-    setTimeout(() => {
-      console.log("⚠️ Forcing exit...");
-      process.exit(1);
-    }, 5000);
-  }
-}, 60000); // Check every 30 seconds
-
 /* =========================================================
    🕒 TIME HELPERS (UPDATED FOR PAKISTAN TIME)
    ========================================================= */
@@ -98,35 +58,17 @@ function utcToPKT(date) {
    Middleware
    ========================================================= */
 app.use(cors());
-app.use(bodyParser.json({ limit: "2mb" })); // Reduced from 100MB to 2MB (2% of original)
-app.use(bodyParser.urlencoded({ extended: true, limit: "2mb" }));
+app.use(bodyParser.json({ limit: "10mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
 
-// Add memory-aware request logging middleware
+// Add request logging middleware
 app.use((req, res, next) => {
-  const startMem = logMemory("Request Start");
-  const startTime = Date.now();
-
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   if (req.method === "POST" && req.body) {
     console.log(
       `📥 Request body length: ${Array.isArray(req.body) ? req.body.length : 1}`,
     );
   }
-
-  res.on("finish", () => {
-    const duration = Date.now() - startTime;
-    const endMem = logMemory("Request End");
-    const memDiff = endMem - startMem;
-
-    console.log(
-      `⏱️ ${req.method} ${req.url} - ${duration}ms, Memory Δ: ${memDiff}MB`,
-    );
-
-    if (memDiff > 50) {
-      console.warn(`⚠️ Large memory increase for ${req.method} ${req.url}`);
-    }
-  });
-
   next();
 });
 
@@ -136,15 +78,8 @@ app.use((req, res, next) => {
 const MONGO_URI =
   process.env.MONGO_URI || "mongodb://127.0.0.1:27017/factory_monitor";
 
-// Set MongoDB query timeouts
-mongoose.set("bufferTimeoutMS", 10000); // 10 second timeout
-
 mongoose
-  .connect(MONGO_URI, {
-    serverSelectionTimeoutMS: 10000, // 10 seconds
-    socketTimeoutMS: 45000, // 45 seconds
-    maxPoolSize: 10, // Reduced connection pool
-  })
+  .connect(MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB Connected");
 
@@ -173,11 +108,7 @@ mongoose
    HTTP + WebSocket
    ========================================================= */
 const server = http.createServer(app);
-const wss = new WebSocketServer({
-  server,
-  path: "/ws/machine-data",
-  maxPayload: 1024 * 1024, // 1MB max message size
-});
+const wss = new WebSocketServer({ server, path: "/ws/machine-data" });
 
 // WebSocket connection logging
 wss.on("connection", (ws, req) => {
@@ -191,31 +122,15 @@ wss.on("connection", (ws, req) => {
 
 function broadcast(payload) {
   const msg = JSON.stringify(payload);
-
-  // Check payload size
-  if (msg.length > 512 * 1024) {
-    // 512KB max (reduced from unlimited)
-    console.warn(`⚠️ Large WebSocket payload: ${msg.length} bytes, truncating`);
-    return;
-  }
-
   let count = 0;
   wss.clients.forEach((c) => {
     if (c.readyState === c.OPEN) {
-      // Add backpressure check
-      if (c.bufferedAmount > 256 * 1024) {
-        // 256KB buffer max
-        console.warn("⚠️ WebSocket client buffer full, skipping");
-        return;
-      }
       c.send(msg);
       count++;
     }
   });
   if (count > 0) {
-    console.log(
-      `📡 Broadcasted to ${count} WebSocket clients (${msg.length} bytes)`,
-    );
+    console.log(`📡 Broadcasted to ${count} WebSocket clients`);
   }
 }
 
@@ -224,43 +139,29 @@ async function filterDuplicates(items) {
 
   console.log(`🔍 Checking ${items.length} items for duplicates...`);
   const uniqueItems = [];
-  const seen = new Map();
+  const seen = new Map(); // Track machine + timestamp combinations
 
-  // Process in smaller chunks to avoid memory spikes
-  const CHUNK_SIZE = 100; // Reduced from processing all at once
-  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-    const chunk = items.slice(i, i + CHUNK_SIZE);
+  for (const item of items) {
+    const tsUTC = parseToUTC(item.timestamp);
+    if (!tsUTC || !item.machine) continue;
 
-    for (const item of chunk) {
-      const tsUTC = parseToUTC(item.timestamp);
-      if (!tsUTC || !item.machine) continue;
+    // Create a unique key: machine + rounded timestamp (to the second)
+    const timeKey = Math.floor(tsUTC.getTime() / 1000);
+    const uniqueKey = `${item.machine}_${timeKey}_${item.status || "UNKNOWN"}`;
 
-      const timeKey = Math.floor(tsUTC.getTime() / 1000);
-      const uniqueKey = `${item.machine}_${timeKey}_${item.status || "UNKNOWN"}`;
-
-      if (!seen.has(uniqueKey)) {
-        seen.set(uniqueKey, true);
-        uniqueItems.push(item);
-      } else {
-        console.log(
-          `  🔍 Skipping in-memory duplicate: ${item.machine} at ${tsUTC.toISOString()}`,
-        );
-      }
-    }
-
-    // Memory cleanup between chunks
-    if (i % 200 === 0) {
-      await new Promise((resolve) => setImmediate(resolve));
+    if (!seen.has(uniqueKey)) {
+      seen.set(uniqueKey, true);
+      uniqueItems.push(item);
+    } else {
+      console.log(
+        `  🔍 Skipping in-memory duplicate: ${item.machine} at ${tsUTC.toISOString()}`,
+      );
     }
   }
 
   console.log(
     `🔍 Filtered ${items.length - uniqueItems.length} duplicates, ${uniqueItems.length} unique items remain`,
   );
-
-  // Clear the Map to free memory
-  seen.clear();
-
   return uniqueItems;
 }
 
@@ -282,7 +183,7 @@ async function saveBatch(items) {
     `💾 Processing ${uniqueItems.length} unique items (filtered from ${items.length} total)...`,
   );
   const saved = [];
-  const CHUNK_SIZE = 10; // Reduced from 50 to 10 (20% of original)
+  const CHUNK_SIZE = 50;
 
   // ✅ FIXED: Process uniqueItems, not items
   for (
@@ -362,7 +263,6 @@ async function saveBatch(items) {
             new: true, // Return the new/updated document
             runValidators: true,
             setDefaultsOnInsert: true,
-            maxTimeMS: 5000, // 5 second timeout
           },
         );
 
@@ -392,21 +292,19 @@ async function saveBatch(items) {
     chunk.length = 0;
     await new Promise((resolve) => setImmediate(resolve));
 
-    // Log memory usage more frequently
-    const currentMem = logMemory(`Chunk ${chunkNumber}`);
-    if (currentMem > 150) {
-      // If over 150MB, pause
-      console.warn(`⏸️  High memory (${currentMem}MB), pausing...`);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Log memory usage
+    if (chunkNumber % 5 === 0) {
+      const used = process.memoryUsage();
+      console.log(
+        `📊 Memory after chunk ${chunkNumber}: ${Math.round(used.heapUsed / 1024 / 1024)}MB`,
+      );
     }
   }
 
   if (saved.length > 0) {
     console.log(`📡 Broadcasting ${saved.length} saved items`);
-    // Only broadcast essential data
     broadcast(
-      saved.slice(0, 50).map((d) => ({
-        // Limit to 50 items for broadcast
+      saved.map((d) => ({
         type: "machine_update",
         machine: d.machineName,
         status: d.status,
@@ -420,7 +318,6 @@ async function saveBatch(items) {
 
   return saved;
 }
-
 /* =========================================================
    REST APIs
    ========================================================= */
@@ -435,21 +332,11 @@ app.get("/", (_, res) => {
       stats: "GET /api/dashboard/stats",
       export: "GET /api/export?machine=&from=&to=",
     },
-    memory: `${logMemory("Root")}MB (Peak: ${peakMemory}MB)`,
   });
 });
 
 app.post("/api/machine-data", async (req, res) => {
   const items = Array.isArray(req.body) ? req.body : [req.body];
-
-  // Limit incoming batch size
-  if (items.length > 1000) {
-    // Reduced from unlimited
-    console.warn(
-      `⚠️ Batch too large: ${items.length} items, truncating to 1000`,
-    );
-    items.length = 1000;
-  }
 
   console.log(`📥 Received ${items.length} items from collector`);
   if (items.length > 0) {
@@ -468,7 +355,6 @@ app.post("/api/machine-data", async (req, res) => {
     saved: saved.length,
     received: items.length,
     timestamp: new Date().toISOString(),
-    memory: `${logMemory("POST /api/machine-data")}MB`,
   });
 });
 
@@ -487,7 +373,7 @@ app.get("/api/dashboard/overview", async (_, res) => {
           shift: { $first: "$shift" },
         },
       },
-    ]).maxTimeMS(10000); // 10 second timeout
+    ]);
 
     const result = rows.map((r) => ({
       machineName: r._id,
@@ -497,7 +383,6 @@ app.get("/api/dashboard/overview", async (_, res) => {
     }));
 
     console.log(`📊 Dashboard overview: ${result.length} machines`);
-    logMemory("Dashboard Overview");
     res.json(result);
   } catch (err) {
     console.error("❌ Dashboard overview error:", err);
@@ -511,7 +396,7 @@ app.get("/api/dashboard/stats", async (_, res) => {
       { $sort: { timestamp: -1 } },
       { $group: { _id: "$machineName", status: { $first: "$status" } } },
       { $group: { _id: "$status", count: { $sum: 1 } } },
-    ]).maxTimeMS(10000); // 10 second timeout
+    ]);
 
     const result = {
       RUNNING: 0,
@@ -528,7 +413,6 @@ app.get("/api/dashboard/stats", async (_, res) => {
     });
 
     console.log(`📊 Dashboard stats:`, result);
-    logMemory("Dashboard Stats");
     res.json(result);
   } catch (err) {
     console.error("❌ Dashboard stats error:", err);
@@ -541,7 +425,7 @@ app.get("/api/machines/status", async (_, res) => {
     const rows = await MachineData.aggregate([
       { $sort: { timestamp: -1 } },
       { $group: { _id: "$machineName", status: { $first: "$status" } } },
-    ]).maxTimeMS(10000); // 10 second timeout
+    ]);
 
     const result = {};
     rows.forEach((r) => {
@@ -549,7 +433,6 @@ app.get("/api/machines/status", async (_, res) => {
     });
 
     console.log(`📊 Real-time status: ${Object.keys(result).length} machines`);
-    logMemory("Machine Status");
     res.json(result);
   } catch (err) {
     console.error("❌ Machine status error:", err);
@@ -558,7 +441,7 @@ app.get("/api/machines/status", async (_, res) => {
 });
 
 app.get("/api/machine-data", async (req, res) => {
-  const { machine, from, to, limit = 100 } = req.query; // Default reduced from 1000 to 100
+  const { machine, from, to, limit = 200 } = req.query;
   console.log(
     `📤 GET request: machine=${machine}, from=${from}, to=${to}, limit=${limit}`,
   );
@@ -573,61 +456,33 @@ app.get("/api/machine-data", async (req, res) => {
   };
 
   try {
-    // Set timeout for query
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("Query timeout")), 15000); // 15 second timeout
-    });
-
-    const queryPromise = MachineData.find(q)
+    const docs = await MachineData.find(q)
       .sort({ timestamp: -1 })
-      .limit(Math.min(parseInt(limit), 500)) // Reduced from 5000 to 500 (10%)
-      .maxTimeMS(10000) // 10 second MongoDB timeout
+      .limit(Math.min(parseInt(limit), 200)) // Cap at 5000 for safety
       .lean();
-
-    const docs = await Promise.race([queryPromise, timeoutPromise]);
 
     console.log(`📊 Found ${docs.length} documents`);
 
-    // Convert UTC timestamps to PKT for frontend - stream response
-    res.setHeader("Content-Type", "application/json");
-    res.write("[");
+    // Convert UTC timestamps to PKT for frontend
+    const results = docs.map((d) => ({
+      ...d,
+      timestamp: utcToPKT(d.timestamp), // Convert to PKT
+      _id: d._id.toString(),
+    }));
 
-    for (let i = 0; i < docs.length; i++) {
-      const d = docs[i];
-      const item = JSON.stringify({
-        ...d,
-        timestamp: utcToPKT(d.timestamp),
-        _id: d._id.toString(),
-      });
-
-      res.write(item);
-      if (i < docs.length - 1) {
-        res.write(",");
-      }
-
-      // Memory check every 50 items
-      if (i % 50 === 0) {
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-    }
-
-    res.write("]");
-    res.end();
-
-    logMemory("GET /api/machine-data");
+    res.json(results);
   } catch (err) {
     console.error("❌ Error fetching data:", err);
-    res.status(500).json({
-      error: "Failed to fetch data",
-      details: err.message,
-      memory: `${logMemory("GET Error")}MB`,
-    });
+    res
+      .status(500)
+      .json({ error: "Failed to fetch data", details: err.message });
   }
 });
 
 /* =========================================================
-   CSV EXPORT - STREAMING VERSION
+   CSV EXPORT
    ========================================================= */
+
 app.get("/api/export", async (req, res) => {
   const { from, to, machine } = req.query;
   console.log(`📥 Export request: machine=${machine}, from=${from}, to=${to}`);
@@ -642,31 +497,22 @@ app.get("/api/export", async (req, res) => {
   }
 
   try {
-    // Limit export size
-    const count = await MachineData.countDocuments(q);
-    if (count > 10000) {
-      // Limit exports to 10,000 records
-      return res.status(400).json({
-        error: "Export too large",
-        message: "Maximum 10,000 records allowed for export",
-        count,
-      });
+    const docs = await MachineData.find(q).sort({ timestamp: 1 }).lean();
+
+    if (docs.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "No data found for the specified criteria" });
     }
 
-    const cursor = MachineData.find(q)
-      .sort({ timestamp: 1 })
-      .maxTimeMS(60000) // 60 second timeout
-      .cursor();
+    // Convert timestamps to PKT for export
+    const exportData = docs.map((d) => ({
+      ...d,
+      timestamp: utcToPKT(d.timestamp),
+      _id: d._id.toString(),
+    }));
 
-    const filename = `machine-data-${new Date()
-      .toISOString()
-      .slice(0, 10)}.csv`;
-
-    res.header("Content-Type", "text/csv");
-    res.attachment(filename);
-
-    // Create CSV parser
-    const parser = new Parser({
+    const csv = new Parser({
       fields: [
         "timestamp",
         "machineName",
@@ -676,56 +522,22 @@ app.get("/api/export", async (req, res) => {
         "shift",
         "durationSeconds",
       ],
-    });
+    }).parse(exportData);
 
-    // Write headers
-    const headers = parser.parse([]);
-    res.write(headers);
+    const filename = `machine-data-${new Date()
+      .toISOString()
+      .slice(0, 10)}.csv`;
 
-    let recordCount = 0;
-    for await (const doc of cursor) {
-      const data = {
-        ...doc.toObject(),
-        timestamp: utcToPKT(doc.timestamp),
-        _id: doc._id.toString(),
-      };
+    res.header("Content-Type", "text/csv");
+    res.attachment(filename);
+    res.send(csv);
 
-      // Write each record
-      const csvLine = parser.parse([data]);
-      // Remove header from each line after the first
-      const line =
-        recordCount === 0 ? csvLine : csvLine.substring(headers.length + 1);
-      res.write(recordCount === 0 ? line : "\n" + line);
-
-      recordCount++;
-
-      // Memory check every 100 records
-      if (recordCount % 100 === 0) {
-        const mem = logMemory(`Export ${recordCount}`);
-        if (mem > 200) {
-          // If over 200MB, stop
-          console.warn(`⚠️ Stopping export due to high memory: ${mem}MB`);
-          break;
-        }
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-
-      // Limit export to 5000 records
-      if (recordCount >= 5000) {
-        console.warn(`⚠️ Export limited to 5000 records`);
-        break;
-      }
-    }
-
-    res.end();
-    console.log(`✅ Exported ${recordCount} records to CSV`);
+    console.log(`✅ Exported ${docs.length} records to CSV`);
   } catch (err) {
     console.error("❌ Export error:", err);
-    res.status(500).json({
-      error: "Failed to export data",
-      details: err.message,
-      memory: `${logMemory("Export Error")}MB`,
-    });
+    res
+      .status(500)
+      .json({ error: "Failed to export data", details: err.message });
   }
 });
 
@@ -734,19 +546,12 @@ app.get("/api/export", async (req, res) => {
    ========================================================= */
 app.get("/health", async (_, res) => {
   try {
-    // Check MongoDB connection with timeout
-    const mongoPromise = mongoose.connection.db.admin().ping();
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("MongoDB timeout")), 5000);
-    });
+    // Check MongoDB connection
+    await mongoose.connection.db.admin().ping();
 
-    await Promise.race([mongoPromise, timeoutPromise]);
-
-    // Get stats with limits
-    const totalRecords = await MachineData.countDocuments({}).maxTimeMS(5000);
-    const latestRecord = await MachineData.findOne({})
-      .sort({ timestamp: -1 })
-      .maxTimeMS(5000);
+    // Get some stats
+    const totalRecords = await MachineData.countDocuments({});
+    const latestRecord = await MachineData.findOne({}).sort({ timestamp: -1 });
 
     res.json({
       status: "healthy",
@@ -761,11 +566,6 @@ app.get("/health", async (_, res) => {
           }
         : null,
       websocketClients: wss.clients.size,
-      memory: {
-        current: `${logMemory("Health Check")}MB`,
-        peak: `${peakMemory}MB`,
-        rss: `${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`,
-      },
     });
   } catch (err) {
     console.error("❌ Health check failed:", err);
@@ -773,13 +573,12 @@ app.get("/health", async (_, res) => {
       status: "unhealthy",
       error: err.message,
       timestamp: new Date().toISOString(),
-      memory: `${logMemory("Health Error")}MB`,
     });
   }
 });
 
 /* =========================================================
-   RETENTION CRON - STREAMING VERSION
+   RETENTION CRON
    ========================================================= */
 cron.schedule("0 3 * * *", async () => {
   console.log("🔄 Running retention cron job...");
@@ -787,10 +586,11 @@ cron.schedule("0 3 * * *", async () => {
   cutoff.setMonth(cutoff.getMonth() - 3);
 
   try {
-    // Process in batches to avoid memory issues
-    const batchSize = 1000;
-    let totalArchived = 0;
-    let hasMore = true;
+    const old = await MachineData.find({ timestamp: { $lte: cutoff } }).lean();
+    if (!old.length) {
+      console.log("📭 No old records to archive");
+      return;
+    }
 
     // Ensure archive directory exists
     const archiveDir = path.join(__dirname, "archives");
@@ -799,66 +599,17 @@ cron.schedule("0 3 * * *", async () => {
     }
 
     const archiveFile = path.join(archiveDir, `archive-${Date.now()}.json`);
-    const writeStream = fs.createWriteStream(archiveFile);
-    writeStream.write("[");
+    fs.writeFileSync(archiveFile, JSON.stringify(old, null, 2));
 
-    let firstRecord = true;
+    await MachineData.deleteMany({ _id: { $in: old.map((d) => d._id) } });
 
-    while (hasMore) {
-      const oldBatch = await MachineData.find({
-        timestamp: { $lte: cutoff },
-      })
-        .limit(batchSize)
-        .lean();
-
-      if (oldBatch.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      // Write batch to file
-      for (const doc of oldBatch) {
-        if (!firstRecord) {
-          writeStream.write(",");
-        }
-        writeStream.write(JSON.stringify(doc));
-        firstRecord = false;
-      }
-
-      // Delete batch
-      const ids = oldBatch.map((d) => d._id);
-      await MachineData.deleteMany({ _id: { $in: ids } });
-
-      totalArchived += oldBatch.length;
-      console.log(`📦 Archived ${totalArchived} records so far...`);
-
-      // Memory check
-      const mem = logMemory(`Retention ${totalArchived}`);
-      if (mem > 200) {
-        console.warn(`⏸️  High memory during retention (${mem}MB), pausing...`);
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-      }
-
-      // Small delay between batches
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    writeStream.write("]");
-    writeStream.end();
-
-    console.log(`✅ Archived ${totalArchived} records to ${archiveFile}`);
+    console.log(`✅ Archived ${old.length} records to ${archiveFile}`);
   } catch (err) {
     console.error("❌ Retention cron job failed:", err);
   }
 });
 
 async function saveLiveStatuses(items) {
-  // Limit batch size
-  if (items.length > 100) {
-    items = items.slice(0, 100);
-    console.warn(`⚠️ Live status batch limited to 100 items`);
-  }
-
   const ops = [];
 
   for (const item of items) {
@@ -873,10 +624,7 @@ async function saveLiveStatuses(items) {
             updatedAt: parseToUTC(item.timestamp || new Date()),
           },
         },
-        {
-          upsert: true,
-          maxTimeMS: 5000,
-        },
+        { upsert: true },
       ),
     );
   }
@@ -886,8 +634,7 @@ async function saveLiveStatuses(items) {
 
     broadcast({
       type: "live_status_update",
-      data: items.slice(0, 50).map((i) => ({
-        // Limit broadcast data
+      data: items.map((i) => ({
         machine: i.machine,
         status: i.status,
         timestamp: utcToPKT(i.timestamp || new Date()),
@@ -903,19 +650,11 @@ async function saveLiveStatuses(items) {
 app.put("/api/live-status", async (req, res) => {
   const items = Array.isArray(req.body) ? req.body : [req.body];
   await saveLiveStatuses(items);
-  res.json({
-    ok: true,
-    updated: items.length,
-    memory: `${logMemory("Live Status")}MB`,
-  });
+  res.json({ ok: true, updated: items.length });
 });
 
 app.get("/api/live-status", async (_, res) => {
-  const rows = await LiveStatus.find({})
-    .limit(1000) // Limit results
-    .maxTimeMS(5000)
-    .lean();
-
+  const rows = await LiveStatus.find({}).lean();
   res.json(
     rows.map((r) => ({
       machine: r.machineName,
@@ -926,32 +665,10 @@ app.get("/api/live-status", async (_, res) => {
 });
 
 app.get("/api/live-status/map", async (_, res) => {
-  const rows = await LiveStatus.find({})
-    .limit(1000) // Limit results
-    .maxTimeMS(5000)
-    .lean();
-
+  const rows = await LiveStatus.find({}).lean();
   const map = {};
   rows.forEach((r) => (map[r.machineName] = r.status));
   res.json(map);
-});
-
-/* =========================================================
-   DEBUG ENDPOINTS
-   ========================================================= */
-app.get("/api/debug/memory", (req, res) => {
-  const used = process.memoryUsage();
-  res.json({
-    heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)}MB`,
-    heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)}MB`,
-    rss: `${Math.round(used.rss / 1024 / 1024)}MB`,
-    external: `${Math.round(used.external / 1024 / 1024)}MB`,
-    arrayBuffers: `${Math.round(used.arrayBuffers / 1024 / 1024)}MB`,
-    peakMemory: `${peakMemory}MB`,
-    uptime: `${process.uptime().toFixed(0)}s`,
-    activeRequests: server._connections,
-    websocketClients: wss.clients.size,
-  });
 });
 
 /* =========================================================
@@ -959,12 +676,10 @@ app.get("/api/debug/memory", (req, res) => {
    ========================================================= */
 app.use((err, req, res, next) => {
   console.error("🔥 Unhandled error:", err);
-  logMemory("Error Handler");
   res.status(500).json({
     error: "Internal server error",
     message: err.message,
     timestamp: new Date().toISOString(),
-    memory: `${logMemory("Error")}MB`,
   });
 });
 
@@ -972,23 +687,8 @@ app.use((err, req, res, next) => {
    SERVER
    ========================================================= */
 const PORT = process.env.PORT || 5000;
-
-// Set server timeouts
-server.setTimeout(30000); // 30 second timeout
-server.keepAliveTimeout = 10000; // 10 seconds
-
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`📊 Dashboard: http://localhost:${PORT}/api/dashboard/overview`);
-  console.log(`🧠 Memory debug: http://localhost:${PORT}/api/debug/memory`);
-  console.log(`⚡ Memory limit: 512MB (Railway Free Tier)`);
-
-  // Start memory monitoring interval
-  setInterval(() => {
-    const mem = logMemory("Interval Check");
-    if (mem > 250) {
-      console.warn(`🚨 CRITICAL: Memory at ${mem}MB, consider restarting`);
-    }
-  }, 60000); // Check every minute
 });
